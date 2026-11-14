@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -426,3 +428,231 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# byte-fingerprint upload dedup
+# ---------------------------------------------------------------------------
+def test_same_bytes_reupload_ingests_once_and_returns_first_receipt(portal):
+    raw = CSV_SPRING.encode("utf-8")
+    first = portal.ingest_upload("spring.csv", raw)
+    assert first["reupload"] is False
+    assert first["upload_id"] == 1
+
+    second = portal.ingest_upload("spring.csv", raw)
+    third = portal.ingest_upload("a-different-name.csv", raw)
+
+    assert second["reupload"] is True
+    assert third["reupload"] is True
+    # The original receipt id and first-import statistics are always returned.
+    for result in (second, third):
+        assert result["upload_id"] == first["upload_id"]
+        assert result["total"] == first["total"]
+        assert result["accepted"] == first["accepted"]
+        assert result["batches"] == first["batches"]
+    assert second["reupload_count"] == 1
+    assert third["reupload_count"] == 2
+
+    assert portal.stats()["utterances"] == 4
+    assert len(portal.uploads()) == 1
+    receipt = portal.uploads()[0]
+    assert receipt["reupload_count"] == 2
+    assert receipt["file_fingerprint"] == first["fingerprint"]
+
+
+def test_same_filename_different_bytes_is_a_new_upload(portal):
+    raw_a = CSV_SPRING.encode("utf-8")
+    raw_b = (CSV_SPRING + "B3,R9,同名文件里多出来的新内容\n").encode("utf-8")
+
+    first = portal.ingest_upload("same-name.csv", raw_a)
+    second = portal.ingest_upload("same-name.csv", raw_b)
+
+    assert second["reupload"] is False
+    assert second["upload_id"] != first["upload_id"]
+    assert second["fingerprint"] != first["fingerprint"]
+    # 4 rows in the first file + 5 in the second: nothing was deduplicated.
+    assert portal.stats()["utterances"] == 9
+    assert len(portal.uploads()) == 2
+
+
+def test_concurrent_identical_uploads_ingest_exactly_once(portal):
+    raw = CSV_SPRING.encode("utf-8")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: portal.ingest_upload("race.csv", raw), range(8)))
+
+    assert portal.stats()["utterances"] == 4
+    assert len(portal.uploads()) == 1
+    receipt_ids = {r["upload_id"] for r in results}
+    assert receipt_ids == {1}
+    assert sorted(r["reupload"] for r in results) == [False] + [True] * 7
+    assert portal.uploads()[0]["reupload_count"] == 7
+
+
+def test_fingerprint_and_receipt_survive_restart(tmp_path):
+    data_dir = tmp_path / "data"
+    raw = CSV_SPRING.encode("utf-8")
+    first = Portal(data_dir)
+    initial = first.ingest_upload("spring.csv", raw)
+    first.shutdown()
+
+    second = Portal(data_dir)
+    try:
+        again = second.ingest_upload("spring.csv", raw)
+        assert again["reupload"] is True
+        assert again["upload_id"] == initial["upload_id"]
+        assert again["accepted"] == initial["accepted"]
+        assert second.stats()["utterances"] == 4
+        assert len(second.uploads()) == 1
+    finally:
+        second.shutdown()
+
+
+def test_reupload_after_full_revocation_returns_history_without_restoring(portal):
+    raw = CSV_SPRING.encode("utf-8")
+    initial = portal.ingest_upload("spring.csv", raw)
+    for respondent in ("R1", "R2", "R3", "R4"):
+        portal.revoke(respondent)
+
+    assert portal.stats()["utterances"] == 0
+    # The receipt is retained even though every corpus row is gone.
+    receipts = portal.uploads()
+    assert len(receipts) == 1
+    assert receipts[0]["id"] == initial["upload_id"]
+
+    again = portal.ingest_upload("spring.csv", raw)
+    assert again["reupload"] is True
+    assert again["upload_id"] == initial["upload_id"]
+    # No corpus is restored and the historical stats are still reported.
+    assert portal.stats()["utterances"] == 0
+    assert again["accepted"] == initial["accepted"] == 4
+    assert len(portal.uploads()) == 1
+
+
+def test_partial_revocation_reupload_never_writes_other_peoples_rows(portal):
+    raw = CSV_SPRING.encode("utf-8")
+    initial = portal.ingest_upload("spring.csv", raw)
+    portal.revoke("R1")
+    assert portal.stats()["utterances"] == 3
+
+    again = portal.ingest_upload("spring.csv", raw)
+    assert again["reupload"] is True
+    assert again["upload_id"] == initial["upload_id"]
+    # R2/R3/R4 are still consenting, but their rows must not be written again.
+    assert portal.stats()["utterances"] == 3
+    with portal.db.read() as conn:
+        remaining = {
+            row["respondent_id"]
+            for row in conn.execute("SELECT DISTINCT respondent_id FROM utterances")
+        }
+    assert remaining == {"R2", "R3", "R4"}
+
+
+def test_failed_import_leaves_no_receipt_and_can_succeed_later(portal):
+    from training_portal.service import ValidationError
+
+    with pytest.raises(ValidationError):
+        portal.ingest_upload("broken.csv", b"batch,text\nB1,missing-column\n")
+    with pytest.raises(ValidationError):
+        portal.ingest_upload("empty.csv", b"batch,respondent_id,text\n")
+    assert portal.uploads() == []
+    assert portal.stats()["utterances"] == 0
+
+    # The same (now valid) bytes are a genuine first import, not a re-upload.
+    result = portal.ingest_upload("fixed.csv", CSV_SPRING.encode("utf-8"))
+    assert result["reupload"] is False
+    assert len(portal.uploads()) == 1
+
+
+def test_legacy_receipt_without_fingerprint_stays_usable_and_never_matches(tmp_path):
+    data_dir = tmp_path / "data"
+    legacy = Portal(data_dir)
+    # Simulate a receipt written by the pre-fingerprint release: no fingerprint,
+    # matching the NULL column produced by the ALTER TABLE migration.
+    with legacy.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO uploads(filename, uploaded_at, total_rows, accepted_rows, "
+            "skipped_revoked, skipped_invalid, batch_count, file_fingerprint, "
+            "batch_names, reupload_count, last_seen_at) "
+            "VALUES ('legacy.csv', ?, 3, 3, 0, 0, 1, NULL, '[]', 0, ?)",
+            ("2025-12-01T00:00:00+00:00", "2025-12-01T00:00:00+00:00"),
+        )
+    legacy.shutdown()
+
+    portal = Portal(data_dir)
+    try:
+        receipts = portal.uploads()
+        assert len(receipts) == 1
+        assert receipts[0]["file_fingerprint"] is None
+
+        # No fingerprint means no guessed identity: the new file is imported,
+        # and the unique index must not reject the second receipt.
+        result = portal.ingest_upload("legacy.csv", CSV_SPRING.encode("utf-8"))
+        assert result["reupload"] is False
+        assert len(portal.uploads()) == 2
+        assert portal.stats()["utterances"] == 4
+    finally:
+        portal.shutdown()
+
+
+def test_schema_migration_adds_fingerprint_columns_to_old_database(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    conn = sqlite3.connect(data_dir / "portal.sqlite3")
+    conn.executescript(
+        """
+        CREATE TABLE uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            total_rows INTEGER NOT NULL,
+            accepted_rows INTEGER NOT NULL,
+            skipped_revoked INTEGER NOT NULL,
+            skipped_invalid INTEGER NOT NULL,
+            batch_count INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO uploads VALUES (1, 'old.csv', '2025-12-01T00:00:00+00:00', "
+        "1, 1, 0, 0, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    portal = Portal(data_dir)
+    try:
+        row = portal.uploads()[0]
+        assert row["file_fingerprint"] is None
+        assert row["reupload_count"] == 0
+        assert row["last_seen_at"] == "2025-12-01T00:00:00+00:00"
+        # A new upload after migration gets a fingerprint and dedup works.
+        raw = CSV_SPRING.encode("utf-8")
+        first = portal.ingest_upload("new.csv", raw)
+        again = portal.ingest_upload("new.csv", raw)
+        assert first["reupload"] is False and again["reupload"] is True
+    finally:
+        portal.shutdown()
+
+
+def test_upload_page_marks_new_import_and_reupload(client):
+    test_client, instance = client
+    raw = CSV_SPRING.encode("utf-8")
+    instance.ingest_upload("spring.csv", raw)
+    instance.ingest_upload("spring.csv", raw)
+
+    html = test_client.get("/").text
+    assert "重传 ×1" in html
+    assert "重传识别" in test_client.post(
+        "/upload", files={"file": ("spring.csv", raw, "text/csv")}
+    ).text
+
+
+def test_upload_endpoint_reports_failed_import_without_receipt(client):
+    test_client, instance = client
+    response = test_client.post(
+        "/upload",
+        files={"file": ("broken.csv", "batch,text\nB1,缺列\n".encode("utf-8"), "text/csv")},
+    )
+    assert response.status_code == 200
+    assert "缺少必需列" in response.text
+    assert instance.uploads() == []

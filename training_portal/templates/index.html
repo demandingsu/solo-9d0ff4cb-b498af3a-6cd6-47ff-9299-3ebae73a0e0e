@@ -30,7 +30,7 @@
     <div class="grid">
       <section class="card">
         <h2>1. 上传访谈语料</h2>
-        <p class="hint">CSV 需包含列：<code>batch</code>（访谈批次）、<code>respondent_id</code>（受访者编号）、<code>text</code>（文本）。也接受中文表头：访谈批次 / 受访者编号 / 文本。</p>
+        <p class="hint">CSV 需包含列：<code>batch</code>（访谈批次）、<code>respondent_id</code>（受访者编号）、<code>text</code>（文本）。也接受中文表头：访谈批次 / 受访者编号 / 文本。系统按文件原始字节识别，超时重传同一文件不会重复入库。</p>
         <form method="post" action="/upload" enctype="multipart/form-data" class="stack">
           <input type="file" name="file" accept=".csv,text/csv">
           <div class="row">
@@ -189,20 +189,32 @@
 
       <section class="card">
         <h2>上传记录</h2>
+        <p class="hint small">按文件原始字节的 SHA-256 指纹去重：相同文件重复或并发提交只入库一次，重传只更新计数并返回首次收据；同名但内容不同视为新文件。「旧记录」来自升级前、没有指纹，不参与去重。</p>
         <div class="tablewrap">
           <table>
-            <thead><tr><th>文件</th><th>读取</th><th>导入</th><th>跳过撤回</th><th>无效</th></tr></thead>
+            <thead><tr><th>文件</th><th>状态</th><th>读取</th><th>导入</th><th>跳过撤回</th><th>无效</th><th>首次上传</th><th>最近提交</th></tr></thead>
             <tbody>
               {% for u in uploads %}
               <tr>
                 <td class="mono">{{ u.filename }}</td>
+                <td>
+                  {% if not u.file_fingerprint %}
+                  <span class="pill">旧记录·无指纹</span>
+                  {% elif u.reupload_count %}
+                  <span class="pill pill-completed">重传 ×{{ u.reupload_count }}</span>
+                  {% else %}
+                  <span class="pill pill-ready">新导入</span>
+                  {% endif %}
+                </td>
                 <td>{{ u.total_rows }}</td>
                 <td>{{ u.accepted_rows }}</td>
                 <td>{{ u.skipped_revoked }}</td>
                 <td>{{ u.skipped_invalid }}</td>
+                <td class="mono">{{ u.uploaded_at | short_time }}</td>
+                <td class="mono">{{ u.last_seen_at | short_time }}</td>
               </tr>
               {% else %}
-              <tr><td colspan="5" class="empty">暂无上传记录</td></tr>
+              <tr><td colspan="8" class="empty">暂无上传记录</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -213,8 +225,10 @@
     <section class="notes">
       <h2>行为说明</h2>
       <ul>
+        <li><strong>按字节指纹去重：</strong>每个文件按原始字节计算 SHA-256 指纹并加唯一索引；相同文件的重复提交、超时重传或并发上传只入库一次，之后重传始终返回首次上传的编号与统计，服务重启也不改变。文件名相同但字节不同会作为新文件处理。</li>
+        <li><strong>撤回后重传只给历史收据：</strong>撤回删除语料但保留上传收据；同一文件再次上传不会恢复任何语料（包括未撤回受访者的行），页面提示「重传识别」并显示首次统计。导入失败的文件不会留下可命中的收据。</li>
+        <li><strong>旧上传保持可用：</strong>升级前产生的上传记录没有文件指纹，标记为「旧记录·无指纹」，不会被推测身份、也不参与指纹去重，其余功能照常。</li>
         <li><strong>撤回先持久化：</strong>撤回记录、语料行删除、导出锁定与任务中止在同一个 SQLite 写事务中提交，任何读取路径都不会看到「已撤回但仍可导出」的中间态。</li>
-        <li><strong>重新上传不复活：</strong>上传时按受访者编号过滤，已撤回行计入「跳过撤回」。撤回后再次上传同号不会重新纳入。</li>
         <li><strong>生成中撤回：</strong>生成按 20 行一个分块，每块前重读撤回表；批次内任一编号被撤回即中止整个任务（其文本与其他语料交错，只删其行仍会泄漏），结果不发布。</li>
         <li><strong>发布前闸门：</strong>临时文件先改名为正式文件，随后在同一事务中复核撤回并写入导出记录；若撤回已发生，文件立即删除，任务标记「已阻止」。</li>
         <li><strong>下载时校验：</strong>每次下载都在写事务中比对撤回表与导出所含编号，命中即锁定该文件、返回拒绝并触发清理。</li>

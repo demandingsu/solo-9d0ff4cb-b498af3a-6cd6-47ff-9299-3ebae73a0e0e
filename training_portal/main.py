@@ -125,10 +125,18 @@ async def upload(
             raise ValidationError("请选择 CSV 文件，或载入本地样例")
 
         result = portal.ingest_upload(filename or "upload.csv", raw)
-        notice = (
-            f"已导入 {result['accepted']} 行（读取 {result['total']} 行），"
-            f"批次：{'、'.join(result['batches']) or '无'}"
-        )
+        if result["reupload"]:
+            notice = (
+                f"重传识别：该文件与上传记录 #{result['upload_id']} 字节完全相同，"
+                f"语料只入库一次，未重复写入（第 {result['reupload_count']} 次提交）。"
+                f"首次导入统计：已导入 {result['accepted']} 行（读取 {result['total']} 行），"
+                f"批次：{'、'.join(result['batches']) or '无'}"
+            )
+        else:
+            notice = (
+                f"已导入 {result['accepted']} 行（读取 {result['total']} 行），"
+                f"批次：{'、'.join(result['batches']) or '无'}"
+            )
         if result["skipped_revoked"]:
             notice += f"；跳过已撤回编号 {result['skipped_revoked']} 行"
         if result["skipped_invalid"]:

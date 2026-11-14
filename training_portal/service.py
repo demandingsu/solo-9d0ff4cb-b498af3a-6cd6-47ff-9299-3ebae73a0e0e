@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import threading
@@ -44,6 +45,17 @@ class ParsedRow:
 
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def file_fingerprint(raw: bytes) -> str:
+    """Identity of an upload: a hash over the file's exact original bytes.
+
+    Byte-level identity is encoding- and parsing-independent: a UTF-8 CSV and
+    the same content re-saved with different whitespace are different files,
+    while a retried upload (timeout, double click, concurrent submit) carries
+    identical bytes and therefore hits the same historical receipt.
+    """
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _normalise_header(name: str) -> str:
@@ -227,60 +239,134 @@ class Portal:
     # uploads
     # ------------------------------------------------------------------
     def ingest_upload(self, filename: str, raw: bytes) -> dict[str, Any]:
+        """Import one uploaded CSV, deduplicating on the exact file bytes.
+
+        Parsing happens before any database write, so a file that fails
+        validation leaves no receipt behind. Once the bytes are parseable, the
+        SHA-256 fingerprint decides the outcome:
+
+        * unknown fingerprint  -> a new receipt and (subject to consent
+          filtering) new corpus rows are inserted in one transaction;
+        * known fingerprint    -> nothing is written twice. The original
+          receipt is returned with its first-import id and statistics, even
+          after a restart or after revocations deleted every corpus row the
+          file ever contributed; only the re-upload counters move.
+
+        Legacy receipts with a NULL fingerprint never match anything: their
+        file identity is unknown and must not be guessed.
+        """
+        # Parse first and parse outside the write transaction: an invalid file
+        # must never create an uploads row that later lookups could hit.
         rows, invalid = parse_csv(raw)
         if not rows and invalid == 0:
             raise ValidationError("CSV 中没有数据行")
 
+        fingerprint = file_fingerprint(raw)
         now = utc_now()
-        with self.db.transaction() as conn:
-            revoked_ids = {
-                row["respondent_id"]
-                for row in conn.execute("SELECT respondent_id FROM revocations")
-            }
-            revoked_hashes = {
-                row["text_hash"]
-                for row in conn.execute("SELECT text_hash FROM revoked_text_hashes")
-            }
-            accepted: list[ParsedRow] = []
-            skipped_revoked = 0
-            for row in rows:
-                # Withdrawn consent is permanent. The same id can never re-enter,
-                # and neither can an utterance that was already withdrawn if it
-                # is re-uploaded under another id.
-                if row.respondent_id in revoked_ids or text_hash(row.text) in revoked_hashes:
-                    skipped_revoked += 1
+        for attempt in range(2):
+            try:
+                with self.db.transaction() as conn:
+                    existing = conn.execute(
+                        "SELECT * FROM uploads WHERE file_fingerprint = ?",
+                        (fingerprint,),
+                    ).fetchone()
+                    if existing is not None:
+                        return self._record_reupload(conn, existing, now)
+                    return self._insert_upload(
+                        conn, filename, rows, invalid, fingerprint, now
+                    )
+            except sqlite3.IntegrityError:
+                # A concurrent request for the same bytes won the unique-index
+                # race (BEGIN IMMEDIATE normally serializes us ahead of this).
+                # Retry once against the now-committed receipt.
+                if attempt == 0:
                     continue
-                accepted.append(row)
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
 
-            batches = sorted({row.batch for row in accepted})
-            for batch in batches:
-                conn.execute(
-                    "INSERT OR IGNORE INTO batches(name, created_at) VALUES (?, ?)",
-                    (batch, now),
-                )
-            cursor = conn.execute(
-                "INSERT INTO uploads(filename, uploaded_at, total_rows, accepted_rows, "
-                "skipped_revoked, skipped_invalid, batch_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    filename,
-                    now,
-                    len(rows),
-                    len(accepted),
-                    skipped_revoked,
-                    invalid,
-                    len(batches),
-                ),
+    def _record_reupload(
+        self, conn: sqlite3.Connection, existing: sqlite3.Row, now: str
+    ) -> dict[str, Any]:
+        """Bump the re-upload counters on an existing receipt, write nothing else."""
+        conn.execute(
+            "UPDATE uploads SET reupload_count = reupload_count + 1, last_seen_at = ? "
+            "WHERE id = ?",
+            (now, existing["id"]),
+        )
+        batches = json.loads(existing["batch_names"] or "[]")
+        return {
+            "upload_id": int(existing["id"]),
+            "total": int(existing["total_rows"]),
+            "accepted": int(existing["accepted_rows"]),
+            "skipped_revoked": int(existing["skipped_revoked"]),
+            "skipped_invalid": int(existing["skipped_invalid"]),
+            "batches": batches,
+            "fingerprint": existing["file_fingerprint"],
+            "reupload": True,
+            "reupload_count": int(existing["reupload_count"]) + 1,
+        }
+
+    def _insert_upload(
+        self,
+        conn: sqlite3.Connection,
+        filename: str,
+        rows: list[ParsedRow],
+        invalid: int,
+        fingerprint: str,
+        now: str,
+    ) -> dict[str, Any]:
+        revoked_ids = {
+            row["respondent_id"]
+            for row in conn.execute("SELECT respondent_id FROM revocations")
+        }
+        revoked_hashes = {
+            row["text_hash"]
+            for row in conn.execute("SELECT text_hash FROM revoked_text_hashes")
+        }
+        accepted: list[ParsedRow] = []
+        skipped_revoked = 0
+        for row in rows:
+            # Withdrawn consent is permanent. The same id can never re-enter,
+            # and neither can an utterance that was already withdrawn if it
+            # is re-uploaded under another id.
+            if row.respondent_id in revoked_ids or text_hash(row.text) in revoked_hashes:
+                skipped_revoked += 1
+                continue
+            accepted.append(row)
+
+        batches = sorted({row.batch for row in accepted})
+        for batch in batches:
+            conn.execute(
+                "INSERT OR IGNORE INTO batches(name, created_at) VALUES (?, ?)",
+                (batch, now),
             )
-            upload_id = int(cursor.lastrowid)
-            conn.executemany(
-                "INSERT INTO utterances(upload_id, batch, respondent_id, text, "
-                "created_at) VALUES (?, ?, ?, ?, ?)",
-                [
-                    (upload_id, row.batch, row.respondent_id, row.text, now)
-                    for row in accepted
-                ],
-            )
+        cursor = conn.execute(
+            "INSERT INTO uploads(filename, uploaded_at, total_rows, accepted_rows, "
+            "skipped_revoked, skipped_invalid, batch_count, file_fingerprint, "
+            "batch_names, reupload_count, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                filename,
+                now,
+                len(rows),
+                len(accepted),
+                skipped_revoked,
+                invalid,
+                len(batches),
+                fingerprint,
+                json.dumps(batches, ensure_ascii=False),
+                now,
+            ),
+        )
+        upload_id = int(cursor.lastrowid)
+        conn.executemany(
+            "INSERT INTO utterances(upload_id, batch, respondent_id, text, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                (upload_id, row.batch, row.respondent_id, row.text, now)
+                for row in accepted
+            ],
+        )
         return {
             "upload_id": upload_id,
             "total": len(rows),
@@ -288,6 +374,9 @@ class Portal:
             "skipped_revoked": skipped_revoked,
             "skipped_invalid": invalid,
             "batches": batches,
+            "fingerprint": fingerprint,
+            "reupload": False,
+            "reupload_count": 0,
         }
 
     # ------------------------------------------------------------------
@@ -339,10 +428,10 @@ class Portal:
             deleted_rows = conn.execute(
                 "DELETE FROM utterances WHERE respondent_id = ?", (respondent_id,)
             ).rowcount
-            conn.execute(
-                "DELETE FROM uploads WHERE id NOT IN "
-                "(SELECT DISTINCT upload_id FROM utterances)"
-            )
+            # Upload receipts are intentionally retained even when the
+            # revocation removes every row an upload contributed: re-uploading
+            # the same bytes must answer with this historical receipt, and the
+            # upload history must keep showing what was first accepted.
 
             newly_locked = 0
             if export_ids:

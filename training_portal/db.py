@@ -23,8 +23,23 @@ CREATE TABLE IF NOT EXISTS uploads (
     accepted_rows    INTEGER NOT NULL,
     skipped_revoked  INTEGER NOT NULL,
     skipped_invalid  INTEGER NOT NULL,
-    batch_count      INTEGER NOT NULL
+    batch_count      INTEGER NOT NULL,
+    -- SHA-256 of the file's exact bytes. NULL for receipts written by older
+    -- versions that predated fingerprinting: their identity is never guessed.
+    file_fingerprint TEXT,
+    -- Sorted distinct batch names captured at first import (JSON), so a
+    -- historical receipt can still report its statistics after every corpus
+    -- row of the upload has been deleted by revocations.
+    batch_names      TEXT NOT NULL DEFAULT '[]',
+    reupload_count   INTEGER NOT NULL DEFAULT 0,
+    last_seen_at     TEXT NOT NULL
 );
+
+-- A given byte sequence can only ever have one receipt. The partial index
+-- leaves legacy fingerprint-less rows (file_fingerprint IS NULL) untouched,
+-- exactly as required for backwards compatibility.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_fingerprint
+    ON uploads(file_fingerprint) WHERE file_fingerprint IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS utterances (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +178,10 @@ class Database:
         conn = self.connect()
         try:
             conn.execute("PRAGMA journal_mode = WAL")
+            # Migrate tables from older releases first: the fresh schema below
+            # uses CREATE TABLE / CREATE INDEX IF NOT EXISTS, so the migrated
+            # table and its partial unique index simply carry through.
+            self._migrate_uploads(conn)
             conn.executescript(SCHEMA)
         finally:
             conn.close()
@@ -174,6 +193,44 @@ class Database:
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                     (key, value),
                 )
+
+    @staticmethod
+    def _migrate_uploads(conn: sqlite3.Connection) -> None:
+        """Add fingerprint columns to databases created by an older release.
+
+        Existing receipts keep ``file_fingerprint = NULL`` on purpose: without
+        the original bytes we cannot reconstruct the fingerprint, and guessing
+        an identity would risk merging two different uploads. The partial
+        unique index therefore ignores them, and they keep working as before.
+        """
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'uploads'"
+        ).fetchone()
+        if table is None:
+            # Brand-new database: the full schema below creates the table.
+            return
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(uploads)")}
+        added = False
+        if "file_fingerprint" not in columns:
+            conn.execute("ALTER TABLE uploads ADD COLUMN file_fingerprint TEXT")
+            added = True
+        if "batch_names" not in columns:
+            conn.execute("ALTER TABLE uploads ADD COLUMN batch_names TEXT NOT NULL DEFAULT '[]'")
+            added = True
+        if "reupload_count" not in columns:
+            conn.execute("ALTER TABLE uploads ADD COLUMN reupload_count INTEGER NOT NULL DEFAULT 0")
+            added = True
+        if "last_seen_at" not in columns:
+            conn.execute(
+                "ALTER TABLE uploads ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute("UPDATE uploads SET last_seen_at = uploaded_at WHERE last_seen_at = ''")
+            added = True
+        if added:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_fingerprint "
+                "ON uploads(file_fingerprint) WHERE file_fingerprint IS NOT NULL"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
